@@ -1,22 +1,17 @@
-import express from 'express';
-import http from 'http';
-import cors from 'cors';
-import { Server } from 'socket.io';
+const dotenv = require('dotenv'); dotenv.config();
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const { Server } = require('socket.io');
 
 const app = express();
-const defaultOrigins = ['http://localhost:5176','http://localhost:5173','https://shaalkal.web.app'];
-const allowedOrigins = (process.env.ALLOWED_ORIGINS?.split(',').map(s=>s.trim()).filter(Boolean)) || defaultOrigins;
+const defaultOrigins = ['http://localhost:5173','http://127.0.0.1:5173','https://shaalkal.web.app'];
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s=>s.trim()).filter(Boolean) : defaultOrigins);
 app.use(cors({ origin: allowedOrigins, methods: ['GET','POST','OPTIONS'], credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ['GET','POST','OPTIONS'],
-    credentials: true
-  }
-});
+const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET','POST','OPTIONS'], credentials: true } });
 
 // In-memory store for MVP
 const rooms = new Map();
@@ -32,6 +27,7 @@ io.on('connection', (socket) => {
     rooms.set(pin, {
       hostId: socket.id,
       title: title || 'New Quiz',
+      meta: { title: title || 'New Quiz', coverImageUrl: '', coverDescription: '' },
       players: new Map(),
       currentQuestion: null,
       questionEndsAt: null,
@@ -69,6 +65,8 @@ io.on('connection', (socket) => {
     room.questionEndsAt = now + durationMs;
     room.paused = false;
     room.pauseRemainingMs = null;
+    // hide any interstitial screen
+    io.to(pin).emit('interstitial:hide');
     // reset player answers
     room.players.forEach(p => { p.answer = null; p.answeredAt = null; });
     io.to(pin).emit('question:start', { question: room.currentQuestion, endsAt: room.questionEndsAt });
@@ -121,6 +119,23 @@ io.on('connection', (socket) => {
     room.questionEndsAt = null;
   });
 
+  // Host updates quiz meta (cover image/description/title)
+  socket.on('host:set_meta', ({ pin, meta }) => {
+    const room = rooms.get(pin);
+    if (!room || room.hostId !== socket.id) return;
+    room.meta = { ...(room.meta||{}), ...(meta||{}) };
+    if (typeof room.meta.title === 'string') room.title = room.meta.title;
+    io.to(pin).emit('room:meta', room.meta);
+  });
+
+  // Host shows interstitial screen between questions
+  socket.on('host:interstitial', ({ pin, message, durationMs, imageUrl, youtubeUrl, bgColor }) => {
+    const room = rooms.get(pin);
+    if (!room || room.hostId !== socket.id) return;
+    const payload = { message: String(message||'שאלה הבאה מיד...'), imageUrl: imageUrl||'', youtubeUrl: youtubeUrl||'', bgColor: bgColor||'', until: durationMs ? (Date.now()+Number(durationMs)) : null };
+    io.to(pin).emit('interstitial:show', payload);
+  });
+
   // Host pauses current question
   socket.on('host:pause_question', ({ pin }) => {
     const room = rooms.get(pin);
@@ -141,6 +156,24 @@ io.on('connection', (socket) => {
     room.questionEndsAt = Date.now() + dur;
     room.pauseRemainingMs = null;
     io.to(pin).emit('question:resumed', { endsAt: room.questionEndsAt });
+  });
+
+  // Host requests to skip the video segment gating so players can answer now
+  socket.on('host:skip_video', ({ pin }) => {
+    const room = rooms.get(pin);
+    if (!room || room.hostId !== socket.id) return;
+    io.to(pin).emit('video:skip');
+  });
+
+  // Host requests to show current scores to all players
+  socket.on('host:show_scores', ({ pin }) => {
+    const room = rooms.get(pin);
+    if (!room || room.hostId !== socket.id) return;
+    const leaderboard = Array.from(room.players.values())
+      .map(p => ({ name: p.name, score: p.score || 0 }))
+      .sort((a,b) => b.score - a.score)
+      .slice(0, 50);
+    io.to(pin).emit('scores:show', { leaderboard });
   });
 
   // Host ends the game and sends final leaderboard

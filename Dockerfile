@@ -12,7 +12,6 @@ COPY . ./
 
 # Runtime
 ENV NODE_ENV=production
-ENV PORT=4000
-
-EXPOSE 4000
+# Cloud Run will inject PORT (default 8080). Our app reads process.env.PORT.
+EXPOSE 8080
 CMD ["node", "index.js"]
