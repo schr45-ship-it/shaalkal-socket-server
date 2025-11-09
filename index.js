@@ -206,5 +206,30 @@ io.on('connection', (socket) => {
 app.get('/', (_req, res) => res.send('Quiz Live server running'));
 app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
 
+// Simple AI endpoint — returns mock questions when no OPENAI_API_KEY is provided
+app.post('/ai/generate', async (req, res) => {
+  try {
+    const promptText = String(req.body?.promptText || '').trim()
+    const count = Math.max(1, Math.min(20, Number(req.body?.count)||8))
+    // Very lightweight mock: derive questions from lines/segments of the text
+    const base = promptText || 'נושא כללי'
+    const seeds = base
+      .replace(/\r/g,'')
+      .split(/\n+|[.!?]+\s+/)
+      .map(s=>s.trim()).filter(Boolean)
+    const qs = []
+    for (let i=0;i<count;i++){
+      const s = seeds[i % Math.max(1,seeds.length)] || base
+      const text = `שאלה: ${s.slice(0,80)}`
+      const correct = Math.floor(Math.random()*4)
+      const opts = new Array(4).fill(0).map((_,j)=> j===correct ? `נכון: ${s.slice(0,24) || 'תשובה'}` : `טעות ${j+1}: ${base.slice((j+1)*2, (j+2)*2) || 'אפשרות'}`)
+      qs.push({ text, options: opts, correct, durationSec: 15 })
+    }
+    return res.json({ title: 'חידון חדש', questions: qs })
+  } catch (e) {
+    res.status(400).json({ error: 'bad_request' })
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
