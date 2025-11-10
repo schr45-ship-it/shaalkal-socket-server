@@ -513,7 +513,7 @@ app.post('/ai/generate', async (req, res) => {
           '{"title":"דוד בן גוריון","questions":[{"text":"באיזו שנה הוכרזה מדינת ישראל?","options":["1948","1936","1956","1967"],"correct":0,"durationSec":15}]}',
           `מספר שאלות: ${count}. נושא/טקסט מקור:\n${promptText || 'כללי'}`
         ].join('\n');
-        const result = await withTimeout(model.generateContent(prompt), 6000);
+        const result = await withTimeout(model.generateContent(prompt), 8000);
         const content = result?.response?.text() || '{}';
         const parsed = JSON.parse(content);
         if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
@@ -544,7 +544,7 @@ app.post('/ai/generate', async (req, res) => {
           model: 'gpt-4o-mini',
           response_format: { type: 'json_object' },
           messages: [ { role: 'system', content: sys }, { role: 'user', content: user } ]
-        }), 6000);
+        }), 8000);
         const content = chat.choices?.[0]?.message?.content || '{}';
         const parsed = JSON.parse(content);
         if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
@@ -556,27 +556,30 @@ app.post('/ai/generate', async (req, res) => {
       }
     }
 
-    // 3) Mock generator as a safe fallback
+    // 3) Mock generator as a safe fallback (בלי חיתוך טקסט בעברית)
     {
-      const base = promptText || 'נושא כללי';
-      const seeds = base
-        .replace(/\r/g,'')
-        .split(/\n+|[.!?]+\s+/)
-        .map(s=>s.trim()).filter(Boolean);
+      const base = (promptText || 'נושא כללי').replace(/\s+/g,' ').trim();
+      const seedTitle = base.replace(/^חידון[:\s]*/,'').slice(0,40) || 'חידון חדש';
+      const genericOpts = ['אפשרות א','אפשרות ב','אפשרות ג','אפשרות ד'];
+      const yearBase = 1948;
       const qs = [];
-      for (let i=0;i<count;i++){
-        const s = seeds[i % Math.max(1,seeds.length)] || base;
-        const text = `שאלה: ${s.slice(0,80)}`;
+      for (let i=0; i<count; i++){
+        const text = `שאלה ${i+1}`;
         const correct = Math.floor(Math.random()*4);
-        const opts = [
-          `${s.slice(0,24) || 'אפשרות א'}`,
-          `${base.slice(2, 26) || 'אפשרות ב'}`,
-          `${base.slice(4, 28) || 'אפשרות ג'}`,
-          `${base.slice(6, 30) || 'אפשרות ד'}`
-        ];
+        // נסה להכין מסיחים שונים—אם יש מספרים בטקסט, השתמש בשנים; אחרת אופציות כלליות
+        const hasNumber = /\d/.test(base);
+        let opts;
+        if (hasNumber){
+          const y = yearBase + (i%5)*3;
+          opts = [String(y), String(y-5), String(y+7), String(y+12)];
+        } else {
+          opts = genericOpts.slice();
+        }
+        // ערבוב קל כדי לא לחזור על סדר קבוע
+        for (let j=opts.length-1;j>0;j--){ const k=Math.floor(Math.random()*(j+1)); [opts[j],opts[k]]=[opts[k],opts[j]] }
         qs.push({ text, options: opts, correct, durationSec: 15 });
       }
-      return res.json({ title: 'חידון חדש', questions: sanitizeQuestionList(qs, count, promptText) });
+      return res.json({ title: seedTitle, questions: sanitizeQuestionList(qs, count, promptText) });
     }
   } catch (e) {
     res.status(400).json({ error: 'bad_request' });
