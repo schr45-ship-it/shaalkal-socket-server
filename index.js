@@ -1,5 +1,7 @@
 const dotenv = require('dotenv'); dotenv.config();
 const express = require('express');
+const OpenAI = require('openai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
@@ -9,6 +11,35 @@ const defaultOrigins = ['http://localhost:5173','http://127.0.0.1:5173','https:/
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s=>s.trim()).filter(Boolean) : defaultOrigins);
 app.use(cors({ origin: allowedOrigins, methods: ['GET','POST','OPTIONS'], credentials: true }));
 app.use(express.json({ limit: '2mb' }));
+
+function sanitizeOption(s) {
+  let t = String(s || '').trim();
+  // remove common prefixes like numbering or bullets
+  t = t.replace(/^([\-–—•]|\d+\.|\(?\d+\)?|[A-Dא-ד]\.|[A-Dא-ד]\)|\(?[A-Dא-ד]\)?)(\s+)?/, '');
+  // remove labels like 'נכון', 'טעות', 'תשובה', 'Correct', 'Wrong'
+  t = t.replace(/^\s*(נכון:?|תשובה\s*נכונה:?|טעות:?|שגוי:?|Correct:?|True:?|False:?|Wrong:?)/i, '').trim();
+  // collapse spaces and clip length
+  t = t.replace(/\s+/g, ' ').trim().slice(0, 80);
+  return t || 'אפשרות';
+}
+
+function sanitizeQuestionList(list, count) {
+  const qs = (list || []).slice(0, count).map((q) => {
+    const optsRaw = Array.isArray(q.options) ? q.options.slice(0, 4) : [];
+    let opts = optsRaw.map(sanitizeOption);
+    // ensure exactly 4 options; pad simple distractors if needed
+    const fillers = ['אפשרות א', 'אפשרות ב', 'אפשרות ג', 'אפשרות ד'];
+    while (opts.length < 4) opts.push(fillers[opts.length] || 'אפשרות');
+    opts = opts.slice(0, 4);
+    return {
+      text: String(q.text || '').replace(/^שאלה:?\s*/,'').slice(0, 200),
+      options: opts,
+      correct: Math.max(0, Math.min(3, Number(q.correct) || 0)),
+      durationSec: Math.max(5, Math.min(120, Number(q.durationSec) || 15))
+    };
+  });
+  return qs;
+}
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET','POST','OPTIONS'], credentials: true } });
@@ -209,25 +240,86 @@ app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
 // Simple AI endpoint — returns mock questions when no OPENAI_API_KEY is provided
 app.post('/ai/generate', async (req, res) => {
   try {
-    const promptText = String(req.body?.promptText || '').trim()
-    const count = Math.max(1, Math.min(20, Number(req.body?.count)||8))
-    // Very lightweight mock: derive questions from lines/segments of the text
-    const base = promptText || 'נושא כללי'
-    const seeds = base
-      .replace(/\r/g,'')
-      .split(/\n+|[.!?]+\s+/)
-      .map(s=>s.trim()).filter(Boolean)
-    const qs = []
-    for (let i=0;i<count;i++){
-      const s = seeds[i % Math.max(1,seeds.length)] || base
-      const text = `שאלה: ${s.slice(0,80)}`
-      const correct = Math.floor(Math.random()*4)
-      const opts = new Array(4).fill(0).map((_,j)=> j===correct ? `נכון: ${s.slice(0,24) || 'תשובה'}` : `טעות ${j+1}: ${base.slice((j+1)*2, (j+2)*2) || 'אפשרות'}`)
-      qs.push({ text, options: opts, correct, durationSec: 15 })
+    const promptText = String(req.body?.promptText || '').trim();
+    const count = Math.max(1, Math.min(20, Number(req.body?.count)||8));
+
+    // 1) Prefer Gemini if GOOGLE_API_KEY is set
+    if (process.env.GOOGLE_API_KEY) {
+      try {
+        const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+        const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: { responseMimeType: 'application/json' }
+        });
+        const prompt = [
+          'אתה מחולל חידונים. החזר אך ורק JSON תקין בעברית עם הסכמה הבאה:',
+          '{ "title": string, "questions": [ { "text": string, "options": string[4], "correct": number(0-3), "durationSec": number } ] }',
+          `מספר שאלות: ${count}. טקסט מקור:\n${promptText || 'כללי'}`
+        ].join('\n');
+        const result = await model.generateContent(prompt);
+        const content = result?.response?.text() || '{}';
+        const parsed = JSON.parse(content);
+        if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
+        const qs = sanitizeQuestionList(parsed.questions, count);
+        const title = String(parsed.title||'חידון חדש').slice(0,60);
+        return res.json({ title, questions: qs });
+      } catch (e) {
+        // fall through to OpenAI or mock
+      }
     }
-    return res.json({ title: 'חידון חדש', questions: qs })
+
+    // 2) Else try OpenAI if available
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const sys = 'You are a quiz generator. Return strictly valid JSON in Hebrew with the schema: { "title": string, "questions": [ { "text": string, "options": string[4], "correct": number(0-3), "durationSec": number } ] }. Avoid markdown. Keep options exactly 4. durationSec around 15.';
+        const user = `צור חידון בעברית על בסיס הטקסט הבא. מספר שאלות: ${count}. טקסט מקור:\n\n${promptText || 'כללי'}`;
+        const chat = await client.chat.completions.create({
+          model: 'gpt-4o-mini',
+          response_format: { type: 'json_object' },
+          messages: [ { role: 'system', content: sys }, { role: 'user', content: user } ]
+        });
+        const content = chat.choices?.[0]?.message?.content || '{}';
+        const parsed = JSON.parse(content);
+        if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
+        const qs = parsed.questions.slice(0, count).map((q)=> ({
+          text: String(q.text||'').slice(0,200),
+          options: Array.isArray(q.options) ? q.options.slice(0,4).map(s=>String(s||'').slice(0,80)) : [],
+          correct: Math.max(0, Math.min(3, Number(q.correct)||0)),
+          durationSec: Math.max(5, Math.min(120, Number(q.durationSec)||15))
+        }));
+        const title = String(parsed.title||'חידון חדש').slice(0,60);
+        return res.json({ title, questions: qs });
+      } catch (e) {
+        // fall through to mock
+      }
+    }
+
+    // 3) Mock generator as a safe fallback
+    {
+      const base = promptText || 'נושא כללי';
+      const seeds = base
+        .replace(/\r/g,'')
+        .split(/\n+|[.!?]+\s+/)
+        .map(s=>s.trim()).filter(Boolean);
+      const qs = [];
+      for (let i=0;i<count;i++){
+        const s = seeds[i % Math.max(1,seeds.length)] || base;
+        const text = `שאלה: ${s.slice(0,80)}`;
+        const correct = Math.floor(Math.random()*4);
+        const opts = [
+          `${s.slice(0,24) || 'אפשרות א'}`,
+          `${base.slice(2, 26) || 'אפשרות ב'}`,
+          `${base.slice(4, 28) || 'אפשרות ג'}`,
+          `${base.slice(6, 30) || 'אפשרות ד'}`
+        ];
+        qs.push({ text, options: opts, correct, durationSec: 15 });
+      }
+      return res.json({ title: 'חידון חדש', questions: sanitizeQuestionList(qs, count) });
+    }
   } catch (e) {
-    res.status(400).json({ error: 'bad_request' })
+    res.status(400).json({ error: 'bad_request' });
   }
 });
 
