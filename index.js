@@ -12,6 +12,13 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGIN
 app.use(cors({ origin: allowedOrigins, methods: ['GET','POST','OPTIONS'], credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]);
+}
+
 function sanitizeOption(s) {
   let t = String(s || '').trim();
   // remove common prefixes like numbering or bullets
@@ -23,18 +30,155 @@ function sanitizeOption(s) {
   return t || 'אפשרות';
 }
 
-function sanitizeQuestionList(list, count) {
+function sanitizeQuestionList(list, count, topicText) {
+  const topic = String(topicText||'');
+  const topicWords = Array.from(new Set(topic
+    .replace(/[^\p{L}\p{N}\s-]/gu,' ')
+    .split(/\s+/)
+    .filter(w => w && w.length >= 3)
+    .slice(0, 12)
+  ));
+  function stripTopic(str){
+    let out = String(str||'');
+    // remove the word 'חידון'
+    out = out.replace(/\bחידון\b/gu, '').trim();
+    // remove topic keywords
+    for (const w of topicWords){
+      const re = new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'giu');
+      out = out.replace(re, '').trim();
+    }
+    out = out.replace(/\s+/g,' ').trim();
+    return out;
+  }
+  function canon(s){
+    let t = sanitizeOption(s).toLowerCase();
+    // unify punctuation and remove wrappers
+    t = t.replace(/[“”"'`]+/g,'');
+    t = t.replace(/[()\[\]{}*]+/g,'');
+    t = t.replace(/[–—‑−]/g,'-');
+    t = t.replace(/\s*-\s*/g,'-');
+    // canonicalize years or year ranges
+    const m = t.match(/(1\d{3}|20\d{2})(?:\s*[-]\s*(1\d{3}|20\d{2}))?/);
+    if (m){
+      const y1 = parseInt(m[1],10);
+      const y2 = m[2] ? parseInt(m[2],10) : null;
+      if (y2!=null){ const a = Math.min(y1,y2), b = Math.max(y1,y2); return `${a}-${b}`; }
+      return String(y1);
+    }
+    return t;
+  }
+  function norm(s){ return canon(s); }
+  function genYearDistractors(baseText, correctText, need, seen){
+    const out = [];
+    const m = String(correctText||'').match(/(1\d{3}|20\d{2})(?:\D+(1\d{3}|20\d{2}))?/);
+    if (m){
+      const y1 = parseInt(m[1],10);
+      const y2 = m[2] ? parseInt(m[2],10) : null;
+      const shifts = [ -7, -5, -3, 3, 5, 7, 10, -10 ];
+      for (let s of shifts){
+        if (out.length>=need) break;
+        const candidate = y2 ? `${y1+s}-${y2+s}` : String(y1+s);
+        const k = norm(candidate);
+        if (!seen.has(k)) out.push(candidate);
+      }
+    }
+    while (out.length<need){
+      const fillers = ['תקופה אחרת', 'בחירה חלופית', 'נתון שונה', 'גרסה אחרת'];
+      const candidate = fillers[out.length % fillers.length];
+      const k = norm(candidate);
+      if (!seen.has(k)) out.push(candidate);
+    }
+    return out;
+  }
+
   const qs = (list || []).slice(0, count).map((q) => {
-    const optsRaw = Array.isArray(q.options) ? q.options.slice(0, 4) : [];
-    let opts = optsRaw.map(sanitizeOption);
-    // ensure exactly 4 options; pad simple distractors if needed
-    const fillers = ['אפשרות א', 'אפשרות ב', 'אפשרות ג', 'אפשרות ד'];
-    while (opts.length < 4) opts.push(fillers[opts.length] || 'אפשרות');
-    opts = opts.slice(0, 4);
+    let cleanText = String(q.text || '').replace(/^שאלה:?\s*/,'').slice(0, 200);
+    cleanText = stripTopic(cleanText) || 'שאלה';
+    const raw = Array.isArray(q.options) ? q.options.slice(0, 4) : [];
+    let correct = Math.max(0, Math.min(3, Number(q.correct) || 0));
+    const sanitized = raw.map(sanitizeOption);
+    // deduplicate while preserving first occurrence and correct mapping
+    const seen = new Map();
+    const unique = [];
+    let correctVal = sanitized[correct] || sanitized[0] || '';
+    for (let i=0;i<sanitized.length;i++){
+      const k = norm(sanitized[i]);
+      if (!seen.has(k)){
+        seen.set(k, unique.length);
+        unique.push(sanitized[i]);
+      } else {
+        // if duplicate was the correct one, remap to the first instance
+        if (i === correct) correct = seen.get(k);
+      }
+    }
+    // ensure correct option present
+    if (unique.length===0){ unique.push(correctVal || 'אפשרות'); correct = 0; }
+    // pad to 4 with smart distractors
+    if (unique.length < 4){
+      const need = 4 - unique.length;
+      const adds = genYearDistractors(cleanText, correctVal, need, seen).map(sanitizeOption);
+      for (const a of adds){
+        const k = norm(a);
+        if (!seen.has(k)){
+          seen.set(k, unique.length);
+          unique.push(a);
+        }
+      }
+      // if still less than 4, use generic placeholders not in seen
+      const fillers = ['אפשרות א', 'אפשרות ב', 'אפשרות ג', 'אפשרות ד'];
+      for (const f of fillers){
+        if (unique.length>=4) break;
+        const k = norm(f);
+        if (!seen.has(k)) { seen.set(k, unique.length); unique.push(f); }
+      }
+    }
+    let options = unique.slice(0,4).map(o => stripTopic(o) || 'אפשרות');
+    // final guard: if correct index out of range, set to 0
+    if (correct < 0 || correct >= options.length) correct = 0;
+    // shuffle options while keeping track of the correct index
+    const idxs = options.map((_,i)=>i);
+    for (let i = idxs.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [idxs[i], idxs[j]] = [idxs[j], idxs[i]];
+    }
+    const shuffled = idxs.map(i => options[i]);
+    const newCorrect = idxs.indexOf(correct);
+    options = shuffled;
+    correct = newCorrect >= 0 ? newCorrect : 0;
+
+    // FINAL ENFORCEMENT: ensure exactly 4 UNIQUE options
+    const final = [];
+    const finalSeen = new Map();
+    let finalCorrect = 0;
+    for (let i=0;i<options.length;i++){
+      const k = norm(options[i]);
+      if (!finalSeen.has(k)){
+        const newIndex = final.length;
+        finalSeen.set(k, newIndex);
+        final.push(options[i]);
+        if (i === correct) finalCorrect = newIndex;
+      } else {
+        // if the duplicate was the correct one, map to first occurrence
+        if (i === correct) finalCorrect = finalSeen.get(k);
+      }
+      if (final.length === 4) break;
+    }
+    // pad if needed with numbered fillers that cannot collide
+    let fillerIdx = 1;
+    while (final.length < 4) {
+      const candidate = `אפשרות ${fillerIdx++}`;
+      const k = norm(candidate);
+      if (!finalSeen.has(k)) {
+        finalSeen.set(k, final.length);
+        final.push(candidate);
+      }
+    }
+    options = final.slice(0,4);
+    correct = (finalCorrect >= 0 && finalCorrect < options.length) ? finalCorrect : 0;
     return {
-      text: String(q.text || '').replace(/^שאלה:?\s*/,'').slice(0, 200),
-      options: opts,
-      correct: Math.max(0, Math.min(3, Number(q.correct) || 0)),
+      text: cleanText,
+      options,
+      correct,
       durationSec: Math.max(5, Math.min(120, Number(q.durationSec) || 15))
     };
   });
@@ -46,6 +190,24 @@ const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET',
 
 // In-memory store for MVP
 const rooms = new Map();
+
+// In-memory AI planning chat sessions (MVP)
+const aiSessions = new Map();
+function getAiSession(id){
+  const now = Date.now();
+  // cleanup expired
+  for (const [sid, s] of aiSessions.entries()) {
+    if ((s.expiresAt||0) < now) aiSessions.delete(sid);
+  }
+  let s = aiSessions.get(id);
+  if (!s) {
+    s = { id, answers: {}, createdAt: now, expiresAt: now + 10*60*1000 };
+    aiSessions.set(id, s);
+  } else {
+    s.expiresAt = now + 10*60*1000;
+  }
+  return s;
+}
 
 function createPin(){
   return String(Math.floor(100000 + Math.random()*900000));
@@ -237,6 +399,92 @@ io.on('connection', (socket) => {
 app.get('/', (_req, res) => res.send('Quiz Live server running'));
 app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
 
+// Chat wizard: ask next clarifying question or return final summary
+app.post('/ai/plan', async (req, res) => {
+  try {
+    const sessionId = String(req.body?.sessionId || 'default');
+    const partial = req.body?.answers || {};
+    const s = getAiSession(sessionId);
+    s.answers = { ...(s.answers||{}), ...(partial||{}) };
+
+    const order = ['topic','level','count','style'];
+    const labels = {
+      topic: 'נושא החידון',
+      level: 'גיל/רמת קהל היעד',
+      count: 'מספר השאלות',
+      style: 'סגנון/התמקדות (למשל היסטוריה, אישים, תאריכים)'
+    };
+
+    function normalize(a){
+      const out = { ...a };
+      if (out.count != null) {
+        const n = Math.max(1, Math.min(20, Number(out.count)||8));
+        out.count = n;
+      }
+      if (typeof out.topic === 'string') out.topic = out.topic.trim();
+      if (typeof out.level === 'string') out.level = out.level.trim();
+      if (typeof out.style === 'string') out.style = out.style.trim();
+      return out;
+    }
+
+    s.answers = normalize(s.answers);
+    const missing = order.find(k => !s.answers[k]);
+
+    if (missing) {
+      // Ask a short Hebrew question for the missing key via Gemini/OpenAI, with a safe fallback
+      const context = `עד כה ידוע: topic="${s.answers.topic||''}", level="${s.answers.level||''}", count="${s.answers.count||''}", style="${s.answers.style||''}".`;
+      const instruction = `נסח משפט שאלה קצר וברור בעברית כדי לבקש ${labels[missing]}. אל תוסיף הסברים. רק שאלה אחת.`;
+
+      async function askWithGemini(){
+        const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+        const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-1.5-flash' });
+        const r = await withTimeout(model.generateContent(`${context}\n${instruction}`), 4000);
+        return (r?.response?.text() || '').trim();
+      }
+      async function askWithOpenAI(){
+        const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const chat = await withTimeout(client.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: 'Write one short Hebrew question only. No explanations.' },
+            { role: 'user', content: `${context}\n${instruction}` }
+          ]
+        }), 4000);
+        return (chat.choices?.[0]?.message?.content || '').trim();
+      }
+
+      let question = '';
+      try {
+        if (process.env.GOOGLE_API_KEY) question = await askWithGemini();
+        else if (process.env.OPENAI_API_KEY) question = await askWithOpenAI();
+      } catch(_e) {}
+      if (!question) {
+        const defaults = {
+          topic: 'על איזה נושא תרצה שהחידון יתמקד?',
+          level: 'מה גיל או רמת קהל היעד?',
+          count: 'כמה שאלות ליצור (1–20)?',
+          style: 'איזה סגנון מועדף? (לדוגמה: תאריכים, אישים, עובדות קצרות)'
+        };
+        question = defaults[missing];
+      }
+      return res.json({ done: false, nextKey: missing, question });
+    }
+
+    // Done: build final summary and prompt for /ai/generate
+    const summary = normalize(s.answers);
+    const promptLines = [
+      summary.topic || 'נושא כללי',
+      summary.level ? `קהל יעד: ${summary.level}` : '',
+      summary.style ? `סגנון: ${summary.style}` : ''
+    ].filter(Boolean);
+    const promptText = promptLines.join('\n');
+    const count = summary.count || 8;
+    return res.json({ done: true, summary, promptText, count });
+  } catch (e) {
+    res.status(400).json({ error: 'bad_request' });
+  }
+});
+
 // Simple AI endpoint — returns mock questions when no OPENAI_API_KEY is provided
 app.post('/ai/generate', async (req, res) => {
   try {
@@ -253,15 +501,23 @@ app.post('/ai/generate', async (req, res) => {
           generationConfig: { responseMimeType: 'application/json' }
         });
         const prompt = [
-          'אתה מחולל חידונים. החזר אך ורק JSON תקין בעברית עם הסכמה הבאה:',
+          'אתה מחולל חידונים. חשוב: אל תעתיק את טקסט הקלט. אל תשתמש במילה "חידון" בגוף השאלות או האופציות. צור שאלות ידע קצרות וברורות על הנושא,',
+          'עם 4 אפשרויות שונות וקצרות כאשר רק אחת נכונה. החזר אך ורק JSON תקין לפי הסכמה:',
           '{ "title": string, "questions": [ { "text": string, "options": string[4], "correct": number(0-3), "durationSec": number } ] }',
-          `מספר שאלות: ${count}. טקסט מקור:\n${promptText || 'כללי'}`
+          'כללים:',
+          '- 4 אופציות בלבד, שונות זו מזו, ללא חזרות, ללא תוויות כמו "נכון"/"טעות".',
+          '- ניסוח קצר (עד 80 תווים לאופציה, ועד 120 תווים לשאלה).',
+          '- אין להשתמש בביטוי "כתוב חידון" או בהוראות המשתמש כנוסח התשובות/שאלות.',
+          '- אם הקלט הוא נושא כללי (כמו "דוד בן גוריון"), הפק שאלות עובדתיות עליו.',
+          'דוגמה (פורמט בלבד, לא להחזיר את הדוגמה):',
+          '{"title":"דוד בן גוריון","questions":[{"text":"באיזו שנה הוכרזה מדינת ישראל?","options":["1948","1936","1956","1967"],"correct":0,"durationSec":15}]}',
+          `מספר שאלות: ${count}. נושא/טקסט מקור:\n${promptText || 'כללי'}`
         ].join('\n');
-        const result = await model.generateContent(prompt);
+        const result = await withTimeout(model.generateContent(prompt), 6000);
         const content = result?.response?.text() || '{}';
         const parsed = JSON.parse(content);
         if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
-        const qs = sanitizeQuestionList(parsed.questions, count);
+        const qs = sanitizeQuestionList(parsed.questions, count, promptText);
         const title = String(parsed.title||'חידון חדש').slice(0,60);
         return res.json({ title, questions: qs });
       } catch (e) {
@@ -273,22 +529,26 @@ app.post('/ai/generate', async (req, res) => {
     if (process.env.OPENAI_API_KEY) {
       try {
         const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const sys = 'You are a quiz generator. Return strictly valid JSON in Hebrew with the schema: { "title": string, "questions": [ { "text": string, "options": string[4], "correct": number(0-3), "durationSec": number } ] }. Avoid markdown. Keep options exactly 4. durationSec around 15.';
-        const user = `צור חידון בעברית על בסיס הטקסט הבא. מספר שאלות: ${count}. טקסט מקור:\n\n${promptText || 'כללי'}`;
-        const chat = await client.chat.completions.create({
+        const sys = 'You generate factual multiple-choice questions in Hebrew. Output strictly valid JSON only with schema: { "title": string, "questions": [ { "text": string, "options": string[4], "correct": number(0-3), "durationSec": number } ] }. No markdown. Exactly 4 short distinct options. Do not copy or echo the user input. Do not use the word "חידון" in questions or options. durationSec ≈ 15.';
+        const user = [
+          `נושא/טקסט: ${promptText || 'כללי'}`,
+          `מספר שאלות: ${count}`,
+          'כללים:',
+          '- שאלות עובדתיות קצרות וברורות.',
+          '- 4 אופציות שונות וקצרות, רק אחת נכונה, ללא תוויות כמו נכון/טעות.',
+          '- אל תעתיק את ההוראה "כתוב חידון" וכדומה.',
+          'דוגמה מבנית (לא להחזיר את הטקסט הזה):',
+          '{"title":"דוד בן גוריון","questions":[{"text":"באיזו שנה הוכרזה מדינת ישראל?","options":["1948","1936","1956","1967"],"correct":0,"durationSec":15}]}'
+        ].join('\n');
+        const chat = await withTimeout(client.chat.completions.create({
           model: 'gpt-4o-mini',
           response_format: { type: 'json_object' },
           messages: [ { role: 'system', content: sys }, { role: 'user', content: user } ]
-        });
+        }), 6000);
         const content = chat.choices?.[0]?.message?.content || '{}';
         const parsed = JSON.parse(content);
         if (!parsed || !Array.isArray(parsed.questions)) throw new Error('bad_output');
-        const qs = parsed.questions.slice(0, count).map((q)=> ({
-          text: String(q.text||'').slice(0,200),
-          options: Array.isArray(q.options) ? q.options.slice(0,4).map(s=>String(s||'').slice(0,80)) : [],
-          correct: Math.max(0, Math.min(3, Number(q.correct)||0)),
-          durationSec: Math.max(5, Math.min(120, Number(q.durationSec)||15))
-        }));
+        const qs = sanitizeQuestionList(parsed.questions, count, promptText);
         const title = String(parsed.title||'חידון חדש').slice(0,60);
         return res.json({ title, questions: qs });
       } catch (e) {
@@ -316,7 +576,7 @@ app.post('/ai/generate', async (req, res) => {
         ];
         qs.push({ text, options: opts, correct, durationSec: 15 });
       }
-      return res.json({ title: 'חידון חדש', questions: sanitizeQuestionList(qs, count) });
+      return res.json({ title: 'חידון חדש', questions: sanitizeQuestionList(qs, count, promptText) });
     }
   } catch (e) {
     res.status(400).json({ error: 'bad_request' });
